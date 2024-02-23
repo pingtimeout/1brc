@@ -1,0 +1,324 @@
+= 1 BRC - Notes
+== Setup
+Launch the instance
+
+[source]
+----
+/Users/pierrelaporte/env/opt/aws-cli/bin/aws ec2 \
+  run-instances \
+  --count 1 \
+  --instance-market-options '{ "MarketType": "spot" }' \
+  --image-id ami-0ea832bf7873542df \
+  --instance-type m5d.2xlarge \
+  --key-name pierre-laporte-aws \
+  --region us-west-2 \
+  --security-group-ids sg-d427d4b0 \
+  --tag-specifications 'ResourceType=instance,Tags=[{Key=dremio_managed,Value=true},{Key=Owner,Value=pierre-laporte},{Key=Name,Value=pierre-test}]' \
+  | jq -r '.Instances[].InstanceType'
+----
+
+Partition the SSD
+
+[source]
+----
+sudo mkfs.ext4 -F /dev/nvme1n1
+sudo mount /dev/nvme1n1 /mnt
+sudo chmod 777 /mnt
+cd /mnt
+sudo yum install git dstat screen -y
+git clone https://github.com/gunnarmorling/1brc.git
+git clone https://github.com/jvm-profiling-tools/async-profiler/releases/download/v2.9/async-profiler-2.9-linux-x64.tar.gz
+----
+
+== Commands
+[source]
+----
+for i in 1 2 3
+do
+  time ./calculate_average_baseline.sh >iteration$i.log
+done
+----
+
+== Run 1 - Baseline
+[source]
+----
+real    4m22.434s
+user    4m20.173s
+sys     0m4.287s
+
+real    4m27.013s
+user    4m24.295s
+sys     0m4.743s
+
+real    4m23.995s
+user    4m21.853s
+sys     0m4.137s
+----
+
+[source]
+----
+----total-cpu-usage---- -dsk/total- -net/total- ---paging-- ---system-- ----system----
+usr sys idl wai hiq siq| read  writ| recv  send|  in   out | int   csw |     time     
+...
+ 12   0  87   0   0   0|  49M   36k|  82B  529B|   0     0 |1210   847 |14-01 15:42:04
+ 12   0  87   0   0   0|  49M   11k|  73B  396B|   0     0 |1218   836 |14-01 15:43:04
+ 12   0  87   0   0   0|  49M 2116B|  75B  398B|   0     0 |1208   822 |14-01 15:44:04
+...
+ 12   0  87   0   0   0|   0    34k|   8B   11B|   0     0 | 867   928 |14-01 15:22:04
+ 12   0  87   0   0   0|  43k 9591B|  63B  315B|   0     0 | 836   856 |14-01 15:23:04
+ 12   0  87   0   0   0|   0  4676B|   7B    8B|   0     0 | 822   841 |14-01 15:24:04
+ 12   0  87   0   0   0|   0    10k|   9B    9B|   0     0 | 818   841 |14-01 15:25:04
+ 13   0  87   0   0   0| 956B   34k| 170B  392B|   0     0 | 899   968 |14-01 15:26:04
+----
+
+[source]
+----
+"main" #1 [8654] prio=5 os_prio=0 cpu=65458,27ms elapsed=65,64s tid=0x00007faeb8028ba0 nid=8654 runnable  [0x00007faec1018000]
+   java.lang.Thread.State: RUNNABLE
+        at jdk.internal.math.FloatingDecimal.parseDouble(java.base@21.0.1/FloatingDecimal.java:110)
+        at java.lang.Double.parseDouble(java.base@21.0.1/Double.java:792)
+        at dev.morling.onebrc.CalculateAverage_baseline$Measurement.<init>(CalculateAverage_baseline.java:33)
+        at dev.morling.onebrc.CalculateAverage_baseline.lambda$main$3(CalculateAverage_baseline.java:89)
+        at dev.morling.onebrc.CalculateAverage_baseline$$Lambda/0x00007fae40002238.apply(Unknown Source)
+        at java.util.stream.ReferencePipeline$3$1.accept(java.base@21.0.1/ReferencePipeline.java:197)
+        at java.util.Iterator.forEachRemaining(java.base@21.0.1/Iterator.java:133)
+        at java.util.Spliterators$IteratorSpliterator.forEachRemaining(java.base@21.0.1/Spliterators.java:1939)
+        at java.util.stream.AbstractPipeline.copyInto(java.base@21.0.1/AbstractPipeline.java:509)
+        at java.util.stream.AbstractPipeline.wrapAndCopyInto(java.base@21.0.1/AbstractPipeline.java:499)
+        at java.util.stream.ReduceOps$ReduceOp.evaluateSequential(java.base@21.0.1/ReduceOps.java:921)
+        at java.util.stream.AbstractPipeline.evaluate(java.base@21.0.1/AbstractPipeline.java:234)
+        at java.util.stream.ReferencePipeline.collect(java.base@21.0.1/ReferencePipeline.java:682)
+        at dev.morling.onebrc.CalculateAverage_baseline.main(CalculateAverage_baseline.java:96)
+----
+
+== Run 2 - Parallel streams, G1GC
+Just the baseline with an extra `.parallel()` after `Files.lines(...)`.
+And `JAVA_OPTS="-Xlog:gc*,safepoint*:file=/mnt/gc.log"` in the run script.
+
+[source]
+----
+real    2m9.977s
+user    11m13.900s
+sys     0m24.315s
+
+real    2m8.384s
+user    11m24.458s
+sys     0m13.351s
+
+real    2m10.474s
+user    11m31.747s
+sys     0m17.791s
+----
+
+[source]
+----
+Average allocation rate: 2030 MB/s
+Application throughput: 78.6%
+Total pause time: 27.136 seconds
+----
+
+[source]
+----
+----total-cpu-usage---- -dsk/total- -net/total- ---paging-- ---system-- ----system----
+usr sys idl wai hiq siq| read  writ| recv  send|  in   out | int   csw |     time
+ 65   3  32   0   0   0|   0    49k|  75B  385B|   0     0 |2664   934 |14-01 16:14:04
+ 65   2  33   0   0   0|   0    10k|  75B  389B|   0     0 |2562  1071 |14-01 16:15:04
+ 68   1  31   0   0   0|   0    50k|  26B  175B|   0     0 |2264  1079 |14-01 16:16:04
+ 66   1  33   0   0   0|   0    14k|  31B  550B|   0     0 |2102  1080 |14-01 16:17:04
+ 66   3  32   0   0   0|   0    54k|  57B   85B|   0     0 |2673   943 |14-01 16:18:04
+----
+
+== Run 3 - Parallel streams, Less string parsing, G1GC
+Run 2 with a Measurement class that does not do String splitting to parse values.
+
+[source]
+----
+real    1m50.572s
+user    6m1.017s
+sys     0m26.703s
+
+real    1m49.657s
+user    6m14.479s
+sys     0m21.645s
+
+real    1m48.590s
+user    6m9.612s
+sys     0m20.719s
+----
+
+[source]
+----
+Average allocation rate: 856 MB/s
+Application throughput: 80.3%
+Total pause time: 21.224 seconds
+----
+
+[source]
+----
+----total-cpu-usage---- -dsk/total- -net/total- ---paging-- ---system-- ----system----
+usr sys idl wai hiq siq| read  writ| recv  send|  in   out | int   csw |     time
+ 42   3  55   0   0   0|   0    44k|  73B  389B|   0     0 |2459   804 |14-01 20:20:04
+ 40   3  57   0   0   0|   0    22k|  72B  434B|   0     0 |2800   996 |14-01 20:21:04
+ 44   2  53   0   0   0|   0    50k|  24B   18B|   0     0 |2739   988 |14-01 20:22:04
+ 41   3  57   0   0   0|   0    46k|  22B   21B|   0     0 |2827  1077 |14-01 20:23:04
+ 45   2  53   0   0   0|   0    20k|  22B   16B|   0     0 |2610   909 |14-01 20:24:04
+----
+
+== Run 4 - Parallel streams, Less string parsing, Parallel GC
+Code from Run 3 but with Parallel GC.
+
+[source]
+----
+real    1m15.236s
+user    3m18.767s
+sys     0m5.431s
+
+real    1m14.335s
+user    3m14.789s
+sys     0m5.277s
+
+real    1m14.258s
+user    3m18.920s
+sys     0m5.471s
+
+real    1m12.719s
+user    3m9.209s
+sys     0m5.457s
+
+real    1m14.293s
+user    3m11.338s
+sys     0m5.507s
+----
+
+[source]
+----
+Average allocation rate: 1684 MB/s
+Application throughput: 98.2%
+Total pause time: 1.284 seconds
+----
+
+[source]
+----
+----total-cpu-usage---- -dsk/total- -net/total- ---paging-- ---system-- ----system----
+usr sys idl wai hiq siq| read  writ| recv  send|  in   out | int   csw |     time
+ 33   1  66   0   0   0|   0    18k|  23B   19B|   0     0 |1746   688 |14-01 20:35:04
+ 33   1  66   0   0   0|   0    48k|  25B   22B|   0     0 |1727   688 |14-01 20:36:04
+ 34   1  66   0   0   0|   0    44k|  25B   22B|   0     0 |1699   581 |14-01 20:37:04
+ 32   1  67   0   0   0|   0    46k| 159B  100B|   0     0 |1670   642 |14-01 20:38:04
+ 32   1  67   0   0   0|   0    57k|  22B   19B|   0     0 |1723   705 |14-01 20:39:04
+----
+
+== Run 5 - Parallel streams, Parallel GC, Inefficient MBB
+Peter Lawrey's solution (Mapped byte-buffers), which is reading multiple chunks simultaneously.
+But the solution is degraded to use Strings as keys instead of reusable byte arrays to cause extra allocations.
+
+[source]
+----
+real    0m51.639s
+user    6m19.103s
+sys     0m2.902s
+
+real    0m51.250s
+user    6m17.085s
+sys     0m2.621s
+
+real    0m51.823s
+user    6m20.957s
+sys     0m2.653s
+
+real    0m49.517s
+user    6m3.482s
+sys     0m2.728s
+
+real    0m51.531s
+user    6m17.663s
+sys     0m2.736s
+----
+
+[source]
+----
+Average allocation rate: 3053 MB/s
+Application throughput: 99.1%
+Total pause time: 0.464 seconds
+----
+
+[source]
+----
+----total-cpu-usage---- -dsk/total- -net/total- ---paging-- ---system-- ----system----
+usr sys idl wai hiq siq| read  writ| recv  send|  in   out | int   csw |     time
+ 93   1   7   0   0   0|   0   119k|  26B  106B|   0     0 |4906  3214 |14-01 20:52:04
+ 93   1   6   0   0   0|   0    70k|  22B   19B|   0     0 |4927  3249 |14-01 20:53:04
+ 93   1   6   0   0   0|   0   120k|  22B   21B|   0     0 |4868  3131 |14-01 20:54:04
+ 92   1   7   0   0   0|   0    94k|  21B   17B|   0     0 |4878  3181 |14-01 20:55:04
+----
+
+== Run 6 - Parallel streams, Parallel GC, Inefficient MBB
+
+[source]
+----
+real    0m16.687s
+user    2m2.811s
+sys     0m1.037s
+
+real    0m16.615s
+user    2m2.013s
+sys     0m1.060s
+
+real    0m17.280s
+user    2m7.167s
+sys     0m1.165s
+
+real    0m16.623s
+user    2m2.206s
+sys     0m1.077s
+
+real    0m18.225s
+user    2m14.418s
+sys     0m0.993s
+----
+
+*Zero GC.*
+
+[source]
+----
+----total-cpu-usage---- -dsk/total- -net/total- ---paging-- ---system-- ----system----
+usr sys idl wai hiq siq| read  writ| recv  send|  in   out | int   csw |     time
+ 92   1   8   0   0   0|   0    59k|  73B  383B|   0     0 |3618   729 |14-01 21:18:04
+ 93   1   6   0   0   0|   0   111k|  88B  786B|   0     0 |3662   652 |14-01 21:19:04
+----
+
+== Lowest theoretical time with disk reads
+24.5 seconds required to read the whole file from disk.
+
+[source]
+----
+$ sudo sync
+$ echo 3 | sudo tee /proc/sys/vm/drop_caches
+$ dd if=/mnt/1brc/measurements.txt of=/dev/null bs=1M
+13146+1 records in
+13146+1 records out
+13785504125 bytes (14 GB) copied, 24.4443 s, 564 MB/s
+----
+
+== Run 7 - Lowest theoretical time - Run 6 with cold cache
+
+[source]
+----
+real    0m25.114s
+user    1m29.445s
+sys     0m3.346s
+----
+
+*Still zero GC because of direct I/O.*
+
+[source]
+----
+----total-cpu-usage---- -dsk/total- -net/total- ---paging-- ---system-- ----system----
+usr sys idl wai hiq siq| read  writ| recv  send|  in   out | int   csw |     time
+  0   2  98   0   0   0| 127M   59k| 413B  426B|   0     0 |1355  2298 |15-01 08:53:52
+ 31   1  61   6   0   0| 277M   81k| 218B  374B|   0     0 |4032  2007 |15-01 08:54:02
+ 40   2   1  57   0   0| 517M 2458B|   8B    9B|   0     0 |6554  8173 |15-01 08:54:12
+ 40   2   8  50   0   0| 516M    0 |   0     0 |   0     0 |6557  7451 |15-01 08:54:22
+  1   0  98   0   0   0|  19M   25k| 331B  828B|   0     0 | 441   217 |15-01 08:54:32
+----
+

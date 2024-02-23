@@ -1,0 +1,908 @@
+<!DOCTYPE html>
+<html lang='en'>
+<head>
+<meta charset='utf-8'>
+<style>
+	body {margin: 0; padding: 10px; background-color: #ffffff}
+	h1 {margin: 5px 0 0 0; font-size: 18px; font-weight: normal; text-align: center}
+	header {margin: -24px 0 5px 0; line-height: 24px}
+	button {font: 12px sans-serif; cursor: pointer}
+	p {margin: 5px 0 5px 0}
+	a {color: #0366d6}
+	#hl {position: absolute; display: none; overflow: hidden; white-space: nowrap; pointer-events: none; background-color: #ffffe0; outline: 1px solid #ffc000; height: 15px}
+	#hl span {padding: 0 3px 0 3px}
+	#status {overflow: hidden; white-space: nowrap}
+	#match {overflow: hidden; white-space: nowrap; display: none; float: right; text-align: right}
+	#reset {cursor: pointer}
+	#canvas {width: 100%; height: 912px}
+</style>
+</head>
+<body style='font: 12px Verdana, sans-serif'>
+<h1>CPU profile</h1>
+<header style='text-align: left'><button id='reverse' title='Reverse'>&#x1f53b;</button>&nbsp;&nbsp;<button id='search' title='Search'>&#x1f50d;</button></header>
+<header style='text-align: right'>Produced by <a href='https://github.com/jvm-profiling-tools/async-profiler'>async-profiler</a></header>
+<canvas id='canvas'></canvas>
+<div id='hl'><span></span></div>
+<p id='match'>Matched: <span id='matchval'></span> <span id='reset' title='Clear'>&#x274c;</span></p>
+<p id='status'>&nbsp;</p>
+<script>
+	// Copyright 2020 Andrei Pangin
+	// Licensed under the Apache License, Version 2.0.
+	'use strict';
+	var root, rootLevel, px, pattern;
+	var reverse = false;
+	const levels = Array(57);
+	for (let h = 0; h < levels.length; h++) {
+		levels[h] = [];
+	}
+
+	const canvas = document.getElementById('canvas');
+	const c = canvas.getContext('2d');
+	const hl = document.getElementById('hl');
+	const status = document.getElementById('status');
+
+	const canvasWidth = canvas.offsetWidth;
+	const canvasHeight = canvas.offsetHeight;
+	canvas.style.width = canvasWidth + 'px';
+	canvas.width = canvasWidth * (devicePixelRatio || 1);
+	canvas.height = canvasHeight * (devicePixelRatio || 1);
+	if (devicePixelRatio) c.scale(devicePixelRatio, devicePixelRatio);
+	c.font = document.body.style.font;
+
+	const palette = [
+		[0xb2e1b2, 20, 20, 20],
+		[0x50e150, 30, 30, 30],
+		[0x50cccc, 30, 30, 30],
+		[0xe15a5a, 30, 40, 40],
+		[0xc8c83c, 30, 30, 10],
+		[0xe17d00, 30, 30,  0],
+		[0xcce880, 20, 20, 20],
+	];
+
+	function getColor(p) {
+		const v = Math.random();
+		return '#' + (p[0] + ((p[1] * v) << 16 | (p[2] * v) << 8 | (p[3] * v))).toString(16);
+	}
+
+	function f(level, left, width, type, title, inln, c1, int) {
+		levels[level].push({left: left, width: width, color: getColor(palette[type]), title: title,
+			details: (int ? ', int=' + int : '') + (c1 ? ', c1=' + c1 : '') + (inln ? ', inln=' + inln : '')
+		});
+	}
+
+	function samples(n) {
+		return n === 1 ? '1 sample' : n.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',') + ' samples';
+	}
+
+	function pct(a, b) {
+		return a >= b ? '100' : (100 * a / b).toFixed(2);
+	}
+
+	function findFrame(frames, x) {
+		let left = 0;
+		let right = frames.length - 1;
+
+		while (left <= right) {
+			const mid = (left + right) >>> 1;
+			const f = frames[mid];
+
+			if (f.left > x) {
+				right = mid - 1;
+			} else if (f.left + f.width <= x) {
+				left = mid + 1;
+			} else {
+				return f;
+			}
+		}
+
+		if (frames[left] && (frames[left].left - x) * px < 0.5) return frames[left];
+		if (frames[right] && (x - (frames[right].left + frames[right].width)) * px < 0.5) return frames[right];
+
+		return null;
+	}
+
+	function search(r) {
+		if (r === true && (r = prompt('Enter regexp to search:', '')) === null) {
+			return;
+		}
+
+		pattern = r ? RegExp(r) : undefined;
+		const matched = render(root, rootLevel);
+		document.getElementById('matchval').textContent = pct(matched, root.width) + '%';
+		document.getElementById('match').style.display = r ? 'inherit' : 'none';
+	}
+
+	function render(newRoot, newLevel) {
+		if (root) {
+			c.fillStyle = '#ffffff';
+			c.fillRect(0, 0, canvasWidth, canvasHeight);
+		}
+
+		root = newRoot || levels[0][0];
+		rootLevel = newLevel || 0;
+		px = canvasWidth / root.width;
+
+		const x0 = root.left;
+		const x1 = x0 + root.width;
+		const marked = [];
+
+		function mark(f) {
+			return marked[f.left] >= f.width || (marked[f.left] = f.width);
+		}
+
+		function totalMarked() {
+			let total = 0;
+			let left = 0;
+			Object.keys(marked).sort(function(a, b) { return a - b; }).forEach(function(x) {
+				if (+x >= left) {
+					total += marked[x];
+					left = +x + marked[x];
+				}
+			});
+			return total;
+		}
+
+		function drawFrame(f, y, alpha) {
+			if (f.left < x1 && f.left + f.width > x0) {
+				c.fillStyle = pattern && f.title.match(pattern) && mark(f) ? '#ee00ee' : f.color;
+				c.fillRect((f.left - x0) * px, y, f.width * px, 15);
+
+				if (f.width * px >= 21) {
+					const chars = Math.floor(f.width * px / 7);
+					const title = f.title.length <= chars ? f.title : f.title.substring(0, chars - 2) + '..';
+					c.fillStyle = '#000000';
+					c.fillText(title, Math.max(f.left - x0, 0) * px + 3, y + 12, f.width * px - 6);
+				}
+
+				if (alpha) {
+					c.fillStyle = 'rgba(255, 255, 255, 0.5)';
+					c.fillRect((f.left - x0) * px, y, f.width * px, 15);
+				}
+			}
+		}
+
+		for (let h = 0; h < levels.length; h++) {
+			const y = reverse ? h * 16 : canvasHeight - (h + 1) * 16;
+			const frames = levels[h];
+			for (let i = 0; i < frames.length; i++) {
+				drawFrame(frames[i], y, h < rootLevel);
+			}
+		}
+
+		return totalMarked();
+	}
+
+	canvas.onmousemove = function() {
+		const h = Math.floor((reverse ? event.offsetY : (canvasHeight - event.offsetY)) / 16);
+		if (h >= 0 && h < levels.length) {
+			const f = findFrame(levels[h], event.offsetX / px + root.left);
+			if (f) {
+				if (f != root) getSelection().removeAllRanges();
+				hl.style.left = (Math.max(f.left - root.left, 0) * px + canvas.offsetLeft) + 'px';
+				hl.style.width = (Math.min(f.width, root.width) * px) + 'px';
+				hl.style.top = ((reverse ? h * 16 : canvasHeight - (h + 1) * 16) + canvas.offsetTop) + 'px';
+				hl.firstChild.textContent = f.title;
+				hl.style.display = 'block';
+				canvas.title = f.title + '\n(' + samples(f.width) + f.details + ', ' + pct(f.width, levels[0][0].width) + '%)';
+				canvas.style.cursor = 'pointer';
+				canvas.onclick = function() {
+					if (f != root) {
+						render(f, h);
+						canvas.onmousemove();
+					}
+				};
+				status.textContent = 'Function: ' + canvas.title;
+				return;
+			}
+		}
+		canvas.onmouseout();
+	}
+
+	canvas.onmouseout = function() {
+		hl.style.display = 'none';
+		status.textContent = '\xa0';
+		canvas.title = '';
+		canvas.style.cursor = '';
+		canvas.onclick = '';
+	}
+
+	canvas.ondblclick = function() {
+		getSelection().selectAllChildren(hl);
+	}
+
+	document.getElementById('reverse').onclick = function() {
+		reverse = !reverse;
+		render();
+	}
+
+	document.getElementById('search').onclick = function() {
+		search(true);
+	}
+
+	document.getElementById('reset').onclick = function() {
+		search(false);
+	}
+
+	window.onkeydown = function() {
+		if (event.ctrlKey && event.keyCode === 70) {
+			event.preventDefault();
+			search(true);
+		} else if (event.keyCode === 27) {
+			search(false);
+		}
+	}
+
+f(0,0,12068,3,'all')
+f(1,0,1,3,'[not_walkable_Java]')
+f(2,0,1,3,'nmethod_entry_barrier')
+f(3,0,1,4,'BarrierSetNMethod::nmethod_stub_entry_barrier(unsigned char**)')
+f(4,0,1,4,'nmethod::oops_do(OopClosure*, bool)')
+f(1,1,25,3,'[unknown_Java]')
+f(2,1,1,1,'I2C/C2I adapters(0xb)')
+f(2,2,24,1,'java/util/HashMap.computeIfAbsent')
+f(1,26,1584,1,'dev/morling/onebrc/CalculateAverage_Run6.main')
+f(2,26,1,1,'java/io/PrintStream.println')
+f(3,26,1,1,'java/lang/String.valueOf')
+f(4,26,1,1,'java/util/AbstractMap.toString')
+f(5,26,1,1,'java/lang/StringBuilder.append')
+f(6,26,1,1,'java/lang/String.valueOf')
+f(7,26,1,1,'dev/morling/onebrc/CalculateAverage_Run6$Measurement.toString')
+f(8,26,1,1,'java/lang/invoke/MethodHandleNatives.linkCallSite')
+f(9,26,1,1,'java/lang/invoke/MethodHandleNatives.linkCallSiteImpl')
+f(10,26,1,1,'java/lang/invoke/CallSite.makeSite')
+f(11,26,1,1,'java/lang/invoke/BootstrapMethodInvoker.invoke')
+f(12,26,1,1,'java/lang/invoke/Invokers$Holder.invokeExact_MT')
+f(13,26,1,1,'java/lang/invoke/DelegatingMethodHandle$Holder.delegate')
+f(14,26,1,1,'java/lang/invoke/DirectMethodHandle$Holder.invokeStatic')
+f(15,26,1,1,'java/lang/invoke/StringConcatFactory.makeConcatWithConstants')
+f(16,26,1,1,'java/lang/invoke/StringConcatFactory.generateMHInlineCopy')
+f(17,26,1,1,'java/lang/invoke/MethodHandles.filterArguments')
+f(18,26,1,1,'java/lang/invoke/MethodHandles.filterRepeatedArgument')
+f(19,26,1,1,'java/lang/invoke/LambdaFormEditor.filterRepeatedArgumentForm')
+f(20,26,1,1,'java/lang/invoke/LambdaFormEditor.makeRepeatedFilterForm')
+f(21,26,1,1,'java/lang/invoke/LambdaForm$Name.<init>')
+f(22,26,1,1,'java/lang/invoke/LambdaForm$NamedFunction.<init>')
+f(23,26,1,1,'java/lang/invoke/Invokers.basicInvoker')
+f(24,26,1,1,'java/lang/invoke/Invokers.invokeBasicMethod')
+f(25,26,1,1,'java/lang/invoke/MethodHandles$Lookup.resolveOrFail')
+f(26,26,1,1,'java/lang/invoke/MemberName$Factory.resolveOrFail')
+f(27,26,1,1,'java/lang/invoke/MemberName$Factory.resolve')
+f(28,26,1,1,'java/lang/invoke/MethodHandleNatives.resolve')
+f(29,26,1,3,'MHN_resolve_Mem')
+f(30,26,1,4,'MethodHandles::resolve_MemberName(Handle, Klass*, int, bool, JavaThread*)')
+f(31,26,1,4,'java_lang_invoke_MethodType::as_signature(oopDesc*, bool)')
+f(32,26,1,4,'outputStream::do_vsnprintf_and_write_with_automatic_buffer(char const*, __va_list_tag*, bool)')
+f(2,27,1,1,'java/lang/invoke/MethodHandleNatives.linkCallSite')
+f(3,27,1,1,'java/lang/invoke/MethodHandleNatives.linkCallSiteImpl')
+f(4,27,1,1,'java/lang/invoke/CallSite.makeSite')
+f(5,27,1,1,'java/lang/invoke/BootstrapMethodInvoker.invoke')
+f(6,27,1,1,'java/lang/invoke/Invokers$Holder.invokeExact_MT')
+f(7,27,1,1,'java/lang/invoke/DirectMethodHandle$Holder.invokeStatic')
+f(8,27,1,1,'java/lang/invoke/LambdaMetafactory.metafactory')
+f(9,27,1,1,'java/lang/invoke/InnerClassLambdaMetafactory.buildCallSite')
+f(10,27,1,1,'java/lang/invoke/MethodHandles.constant')
+f(11,27,1,1,'java/lang/invoke/MethodHandle.bindTo')
+f(12,27,1,1,'java/lang/invoke/MethodHandle.bindArgumentL')
+f(13,27,1,1,'java/lang/invoke/BoundMethodHandle.bindArgumentL')
+f(14,27,1,1,'java/lang/invoke/LambdaFormEditor.bindArgumentL')
+f(15,27,1,1,'java/lang/invoke/LambdaFormEditor.bindArgumentForm')
+f(16,27,1,0,'java/lang/invoke/LambdaFormEditor.getInCache',0,0,1)
+f(2,28,1,1,'java/util/HashMap.forEach')
+f(3,28,1,1,'dev/morling/onebrc/CalculateAverage_Run6$$Lambda.0x00007f2b93024448.accept')
+f(4,28,1,1,'dev/morling/onebrc/CalculateAverage_Run6.lambda$main$2')
+f(5,28,1,1,'dev/morling/onebrc/CalculateAverage_Run6$Key.toString')
+f(6,28,1,1,'java/lang/String.<init>')
+f(7,28,1,1,'java/lang/String.<init>')
+f(8,28,1,0,'java/lang/StringLatin1.inflate',0,0,1)
+f(9,28,1,4,'InterpreterRuntime::resolve_from_cache(JavaThread*, Bytecodes::Code)')
+f(10,28,1,4,'InterpreterRuntime::resolve_invoke(JavaThread*, Bytecodes::Code)')
+f(11,28,1,4,'LinkResolver::resolve_invoke(CallInfo&, Handle, constantPoolHandle const&, int, Bytecodes::Code, JavaThread*)')
+f(12,28,1,4,'LinkResolver::resolve_static_call(CallInfo&, LinkInfo const&, bool, JavaThread*)')
+f(13,28,1,4,'InstanceKlass::initialize_impl(JavaThread*)')
+f(14,28,1,4,'InstanceKlass::link_class_impl(JavaThread*)')
+f(15,28,1,4,'InstanceKlass::link_methods(JavaThread*)')
+f(16,28,1,4,'Method::link_method(methodHandle const&, JavaThread*)')
+f(17,28,1,4,'AdapterHandlerLibrary::get_adapter(methodHandle const&)')
+f(18,28,1,4,'AdapterHandlerLibrary::create_adapter(AdapterBlob*&, int, BasicType*, bool)')
+f(19,28,1,4,'SharedRuntime::generate_i2c2i_adapters(MacroAssembler*, int, int, BasicType const*, VMRegPair const*, AdapterFingerPrint*)')
+f(20,28,1,4,'Assembler::lea(Register, Address)')
+f(2,29,1,1,'java/util/stream/LongStream.range')
+f(3,29,1,1,'java/util/stream/StreamSupport.longStream')
+f(4,29,1,1,'java/util/stream/StreamOpFlag.<clinit>')
+f(5,29,1,1,'java/util/stream/StreamOpFlag.set')
+f(6,29,1,1,'java/util/EnumMap.<init>')
+f(7,29,1,1,'java/util/EnumMap.getKeyUniverse')
+f(8,29,1,1,'java/lang/System$2.getEnumConstantsShared')
+f(9,29,1,1,'java/lang/Class.getEnumConstantsShared')
+f(10,29,1,1,'java/lang/reflect/Method.invoke')
+f(11,29,1,1,'java/lang/reflect/Method.acquireMethodAccessor')
+f(12,29,1,1,'jdk/internal/reflect/ReflectionFactory.newMethodAccessor')
+f(13,29,1,1,'jdk/internal/reflect/MethodHandleAccessorFactory.newMethodAccessor')
+f(14,29,1,1,'jdk/internal/reflect/MethodHandleAccessorFactory.getDirectMethod')
+f(15,29,1,1,'java/lang/invoke/MethodHandleImpl$1.findStatic')
+f(16,29,1,1,'java/lang/invoke/MethodHandles$Lookup.findStatic')
+f(17,29,1,1,'java/lang/invoke/MethodHandles$Lookup.getDirectMethod')
+f(18,29,1,1,'java/lang/invoke/MethodHandles$Lookup.getDirectMethodCommon')
+f(19,29,1,0,'java/lang/invoke/DirectMethodHandle.<clinit>',0,0,1)
+f(20,29,1,4,'InterpreterRuntime::resolve_from_cache(JavaThread*, Bytecodes::Code)')
+f(21,29,1,4,'InterpreterRuntime::resolve_get_put(JavaThread*, Bytecodes::Code)')
+f(22,29,1,4,'LinkResolver::resolve_field_access(fieldDescriptor&, constantPoolHandle const&, int, methodHandle const&, Bytecodes::Code, JavaThread*)')
+f(23,29,1,4,'constantPoolHandle::~constantPoolHandle()')
+f(2,30,1580,1,'java/util/stream/ReferencePipeline.reduce')
+f(3,30,1580,1,'java/util/stream/AbstractPipeline.evaluate')
+f(4,30,1580,1,'java/util/stream/ReduceOps$ReduceOp.evaluateParallel')
+f(5,30,1580,1,'java/util/concurrent/ForkJoinTask.invoke')
+f(6,30,1330,1,'java/util/concurrent/ForkJoinTask.awaitDone')
+f(7,30,1330,1,'java/util/concurrent/ForkJoinPool.helpComplete')
+f(8,30,951,1,'java/util/concurrent/ForkJoinPool$WorkQueue.helpComplete')
+f(9,30,951,1,'java/util/concurrent/ForkJoinTask.doExec')
+f(10,30,951,1,'java/util/concurrent/CountedCompleter.exec')
+f(11,30,951,1,'java/util/stream/AbstractTask.compute')
+f(12,30,951,1,'java/util/stream/ReduceOps$ReduceTask.doLeaf')
+f(13,30,951,1,'java/util/stream/ReduceOps$ReduceTask.doLeaf')
+f(14,30,951,1,'java/util/stream/AbstractPipeline.wrapAndCopyInto')
+f(15,30,951,1,'java/util/stream/AbstractPipeline.copyInto')
+f(16,30,951,1,'java/util/Spliterator$OfLong.forEachRemaining')
+f(17,30,951,1,'java/util/stream/Streams$RangeLongSpliterator.forEachRemaining')
+f(18,30,951,1,'java/util/stream/LongPipeline$1$1.accept')
+f(19,30,951,1,'dev/morling/onebrc/CalculateAverage_Run6$$Lambda.0x00007f2b93000a00.apply')
+f(20,30,951,1,'dev/morling/onebrc/CalculateAverage_Run6.lambda$main$0')
+f(21,30,949,1,'dev/morling/onebrc/CalculateAverage_Run6.extractMeasurementsFromChunk')
+f(22,48,68,2,'dev/morling/onebrc/CalculateAverage_Run6$Measurement.sample',59,0,0)
+f(22,116,296,2,'dev/morling/onebrc/CalculateAverage_Run6.readKey',260,0,0)
+f(23,241,74,2,'dev/morling/onebrc/CalculateAverage_Run6$Key.append',64,0,0)
+f(23,315,27,2,'java/nio/Buffer.remaining',24,0,0)
+f(23,342,70,2,'java/nio/DirectByteBuffer.get',61,0,0)
+f(24,342,26,2,'java/nio/Buffer.nextGetIndex',22,0,0)
+f(24,368,44,2,'jdk/internal/misc/ScopedMemoryAccess.getByte',39,0,0)
+f(25,368,44,2,'jdk/internal/misc/ScopedMemoryAccess.getByteInternal',39,0,0)
+f(26,410,2,5,'asm_exc_page_fault')
+f(27,410,2,5,'exc_page_fault')
+f(28,410,2,5,'do_user_addr_fault')
+f(29,410,2,5,'handle_mm_fault')
+f(30,410,2,5,'__handle_mm_fault')
+f(31,410,2,5,'do_fault')
+f(32,410,2,5,'do_fault_around')
+f(33,410,2,5,'filemap_map_pages')
+f(22,412,233,2,'dev/morling/onebrc/CalculateAverage_Run6.readTemperatureFromBuffer',187,0,0)
+f(23,473,84,2,'java/nio/Buffer.remaining',67,0,0)
+f(23,557,88,2,'java/nio/DirectByteBuffer.get',71,0,0)
+f(24,557,2,2,'java/nio/Buffer.checkIndex',2,0,0)
+f(24,559,51,2,'java/nio/Buffer.nextGetIndex',44,0,0)
+f(24,610,35,2,'jdk/internal/misc/ScopedMemoryAccess.getByte',25,0,0)
+f(25,610,35,2,'jdk/internal/misc/ScopedMemoryAccess.getByteInternal',25,0,0)
+f(26,643,2,5,'asm_exc_page_fault')
+f(27,643,2,5,'exc_page_fault')
+f(28,643,2,5,'do_user_addr_fault')
+f(29,643,2,5,'handle_mm_fault')
+f(30,643,2,5,'__handle_mm_fault')
+f(31,643,2,5,'do_fault')
+f(32,643,2,5,'do_fault_around')
+f(33,643,2,5,'filemap_map_pages')
+f(34,643,2,5,'alloc_set_pte')
+f(35,643,2,5,'page_add_file_rmap')
+f(36,643,2,5,'__mod_memcg_lruvec_state')
+f(37,644,1,5,'__mod_memcg_state.part.0')
+f(22,645,79,2,'dev/morling/onebrc/CalculateAverage_Run6.skipToFirstLine',59,0,0)
+f(22,724,2,2,'java/nio/Buffer.position',1,0,0)
+f(22,726,6,2,'java/nio/Buffer.remaining',4,0,0)
+f(22,732,247,1,'java/util/HashMap.computeIfAbsent')
+f(23,859,114,2,'dev/morling/onebrc/CalculateAverage_Run6$Key.equals',114,0,0)
+f(24,908,65,2,'java/util/Arrays.equals',65,0,0)
+f(25,909,7,2,'java/util/Arrays.rangeCheck',7,0,0)
+f(25,916,57,2,'jdk/internal/util/ArraysSupport.mismatch',57,0,0)
+f(26,962,11,3,'vectorizedMismatch')
+f(23,973,6,2,'java/util/HashMap.hash',6,0,0)
+f(21,979,2,1,'java/util/HashMap.computeIfAbsent')
+f(22,979,2,2,'dev/morling/onebrc/CalculateAverage_Run6$Key.equals',2,0,0)
+f(23,979,2,2,'java/util/Arrays.equals',2,0,0)
+f(24,979,2,2,'jdk/internal/util/ArraysSupport.mismatch',2,0,0)
+f(8,981,379,1,'java/util/concurrent/ForkJoinTask.doExec')
+f(9,981,379,1,'java/util/concurrent/CountedCompleter.exec')
+f(10,981,379,1,'java/util/stream/AbstractTask.compute')
+f(11,981,379,1,'java/util/stream/ReduceOps$ReduceTask.doLeaf')
+f(12,981,379,1,'java/util/stream/ReduceOps$ReduceTask.doLeaf')
+f(13,981,379,1,'java/util/stream/AbstractPipeline.wrapAndCopyInto')
+f(14,981,379,1,'java/util/stream/AbstractPipeline.copyInto')
+f(15,981,379,1,'java/util/Spliterator$OfLong.forEachRemaining')
+f(16,981,379,1,'java/util/stream/Streams$RangeLongSpliterator.forEachRemaining')
+f(17,981,379,1,'java/util/stream/LongPipeline$1$1.accept')
+f(18,981,379,1,'dev/morling/onebrc/CalculateAverage_Run6$$Lambda.0x00007f2b93000a00.apply')
+f(19,981,379,1,'dev/morling/onebrc/CalculateAverage_Run6.lambda$main$0')
+f(20,981,378,1,'dev/morling/onebrc/CalculateAverage_Run6.extractMeasurementsFromChunk')
+f(21,996,36,2,'dev/morling/onebrc/CalculateAverage_Run6$Measurement.sample',36,0,0)
+f(21,1032,134,2,'dev/morling/onebrc/CalculateAverage_Run6.readKey',134,0,0)
+f(22,1087,27,2,'dev/morling/onebrc/CalculateAverage_Run6$Key.append',27,0,0)
+f(22,1114,24,2,'java/nio/Buffer.remaining',24,0,0)
+f(22,1138,28,2,'java/nio/DirectByteBuffer.get',28,0,0)
+f(23,1138,10,2,'java/nio/Buffer.nextGetIndex',10,0,0)
+f(23,1148,18,2,'jdk/internal/misc/ScopedMemoryAccess.getByte',18,0,0)
+f(24,1148,18,2,'jdk/internal/misc/ScopedMemoryAccess.getByteInternal',18,0,0)
+f(21,1166,77,2,'dev/morling/onebrc/CalculateAverage_Run6.readTemperatureFromBuffer',77,0,0)
+f(22,1188,37,2,'java/nio/Buffer.remaining',37,0,0)
+f(22,1225,18,2,'java/nio/DirectByteBuffer.get',18,0,0)
+f(23,1225,2,2,'java/nio/Buffer.checkIndex',2,0,0)
+f(23,1227,13,2,'java/nio/Buffer.nextGetIndex',13,0,0)
+f(23,1240,3,2,'jdk/internal/misc/ScopedMemoryAccess.getByte',3,0,0)
+f(24,1240,3,2,'jdk/internal/misc/ScopedMemoryAccess.getByteInternal',3,0,0)
+f(21,1243,8,2,'dev/morling/onebrc/CalculateAverage_Run6.skipToFirstLine',8,0,0)
+f(21,1251,108,1,'java/util/HashMap.computeIfAbsent')
+f(22,1304,48,2,'dev/morling/onebrc/CalculateAverage_Run6$Key.equals',48,0,0)
+f(23,1322,30,2,'java/util/Arrays.equals',30,0,0)
+f(24,1322,7,2,'java/util/Arrays.rangeCheck',7,0,0)
+f(24,1329,23,2,'jdk/internal/util/ArraysSupport.mismatch',23,0,0)
+f(25,1348,4,3,'vectorizedMismatch')
+f(22,1352,7,2,'java/util/HashMap.hash',7,0,0)
+f(23,1358,1,2,'dev/morling/onebrc/CalculateAverage_Run6$Key.hashCode',1,0,0)
+f(20,1359,1,1,'java/util/HashMap.computeIfAbsent')
+f(21,1359,1,2,'dev/morling/onebrc/CalculateAverage_Run6$Key.equals',1,0,0)
+f(22,1359,1,2,'java/util/Arrays.equals',1,0,0)
+f(23,1359,1,2,'jdk/internal/util/ArraysSupport.mismatch',1,0,0)
+f(6,1360,250,1,'java/util/concurrent/ForkJoinTask.doExec')
+f(7,1360,250,1,'java/util/concurrent/CountedCompleter.exec')
+f(8,1360,250,1,'java/util/stream/AbstractTask.compute')
+f(9,1360,250,1,'java/util/stream/ReduceOps$ReduceTask.doLeaf')
+f(10,1360,250,1,'java/util/stream/ReduceOps$ReduceTask.doLeaf')
+f(11,1360,250,1,'java/util/stream/AbstractPipeline.wrapAndCopyInto')
+f(12,1360,250,1,'java/util/stream/AbstractPipeline.copyInto')
+f(13,1360,250,1,'java/util/Spliterator$OfLong.forEachRemaining')
+f(14,1360,250,1,'java/util/stream/Streams$RangeLongSpliterator.forEachRemaining')
+f(15,1360,250,1,'java/util/stream/LongPipeline$1$1.accept')
+f(16,1360,250,1,'dev/morling/onebrc/CalculateAverage_Run6$$Lambda.0x00007f2b93000a00.apply')
+f(17,1360,250,1,'dev/morling/onebrc/CalculateAverage_Run6.lambda$main$0')
+f(18,1360,250,1,'dev/morling/onebrc/CalculateAverage_Run6.extractMeasurementsFromChunk',0,0,1)
+f(19,1378,1,2,'dev/morling/onebrc/CalculateAverage_Run6$Key.clear',1,0,0)
+f(19,1379,16,2,'dev/morling/onebrc/CalculateAverage_Run6$Measurement.sample',14,0,0)
+f(20,1394,1,0,'java/lang/Math.min',0,0,1)
+f(19,1395,97,2,'dev/morling/onebrc/CalculateAverage_Run6.readKey',96,0,0)
+f(20,1439,17,2,'dev/morling/onebrc/CalculateAverage_Run6$Key.append',17,0,0)
+f(20,1456,10,2,'java/nio/Buffer.remaining',10,0,0)
+f(20,1466,26,2,'java/nio/DirectByteBuffer.get',26,0,0)
+f(21,1466,17,2,'java/nio/Buffer.nextGetIndex',17,0,0)
+f(21,1483,9,2,'jdk/internal/misc/ScopedMemoryAccess.getByte',9,0,0)
+f(22,1483,9,2,'jdk/internal/misc/ScopedMemoryAccess.getByteInternal',9,0,0)
+f(19,1492,51,2,'dev/morling/onebrc/CalculateAverage_Run6.readTemperatureFromBuffer',50,0,0)
+f(20,1506,17,2,'java/nio/Buffer.remaining',17,0,0)
+f(20,1523,20,2,'java/nio/DirectByteBuffer.get',19,0,0)
+f(21,1523,14,2,'java/nio/Buffer.nextGetIndex',14,0,0)
+f(21,1537,6,2,'jdk/internal/misc/ScopedMemoryAccess.getByte',5,0,0)
+f(22,1537,6,2,'jdk/internal/misc/ScopedMemoryAccess.getByteInternal',5,0,0)
+f(19,1543,3,2,'java/nio/Buffer.remaining',3,0,0)
+f(19,1546,63,1,'java/util/HashMap.computeIfAbsent')
+f(20,1582,26,2,'dev/morling/onebrc/CalculateAverage_Run6$Key.equals',26,0,0)
+f(21,1595,13,2,'java/util/Arrays.equals',13,0,0)
+f(22,1595,1,2,'java/util/Arrays.rangeCheck',1,0,0)
+f(22,1596,12,2,'jdk/internal/util/ArraysSupport.mismatch',12,0,0)
+f(23,1605,3,3,'vectorizedMismatch')
+f(20,1608,1,2,'java/util/HashMap.hash',1,0,0)
+f(19,1609,1,1,'sun/nio/ch/FileChannelImpl.map')
+f(20,1609,1,1,'sun/nio/ch/Util.newMappedByteBufferR')
+f(21,1609,1,1,'java/lang/reflect/Constructor.newInstance')
+f(22,1609,1,1,'java/lang/reflect/Constructor.newInstanceWithCaller')
+f(23,1609,1,1,'java/lang/reflect/Constructor.acquireConstructorAccessor')
+f(24,1609,1,1,'jdk/internal/reflect/ReflectionFactory.newConstructorAccessor')
+f(25,1609,1,1,'jdk/internal/reflect/MethodHandleAccessorFactory.newConstructorAccessor')
+f(26,1609,1,1,'java/lang/invoke/MethodHandle.asSpreader')
+f(27,1609,1,1,'java/lang/invoke/MethodHandle.asSpreader')
+f(28,1609,1,1,'java/lang/invoke/MethodHandle.asType')
+f(29,1609,1,1,'java/lang/invoke/MethodHandle.asTypeUncached')
+f(30,1609,1,1,'java/lang/invoke/MethodHandleImpl.makePairwiseConvert')
+f(31,1609,1,1,'java/lang/invoke/MethodHandleImpl.makePairwiseConvert')
+f(32,1609,1,1,'java/lang/invoke/MethodHandleImpl.makePairwiseConvertByEditor')
+f(33,1609,1,1,'java/lang/invoke/MethodHandleImpl.computeValueConversions')
+f(34,1609,1,1,'java/lang/invoke/MethodHandleImpl.valueConversion')
+f(35,1609,1,1,'sun/invoke/util/ValueConversions.unboxWiden')
+f(36,1609,1,1,'sun/invoke/util/ValueConversions.unbox')
+f(37,1609,1,1,'java/lang/invoke/MethodHandles.insertArguments')
+f(38,1609,1,1,'java/lang/invoke/MethodHandles.insertArgumentPrimitive')
+f(39,1609,1,1,'java/lang/invoke/BoundMethodHandle.bindArgumentI')
+f(40,1609,1,1,'java/lang/invoke/LambdaFormEditor.bindArgumentI')
+f(41,1609,1,1,'java/lang/invoke/BoundMethodHandle$Species_L.copyWithExtendI')
+f(42,1609,1,1,'java/lang/invoke/LambdaForm$DMH.0x00007f2b93006400.invokeStatic')
+f(43,1609,1,1,'java/lang/invoke/BoundMethodHandle$Species_LI.make')
+f(44,1609,1,1,'java/lang/invoke/BoundMethodHandle$Species_LI.<init>')
+f(45,1609,1,1,'java/lang/invoke/BoundMethodHandle.<init>')
+f(46,1609,1,1,'java/lang/invoke/MethodHandle.<init>')
+f(47,1609,1,1,'java/lang/invoke/LambdaForm.prepare')
+f(48,1609,1,1,'java/lang/invoke/LambdaForm.compileToBytecode')
+f(49,1609,1,1,'java/lang/invoke/InvokerBytecodeGenerator.generateCustomizedCode')
+f(50,1609,1,1,'java/lang/invoke/InvokerBytecodeGenerator.generateCustomizedCodeBytes')
+f(51,1609,1,1,'java/lang/invoke/InvokerBytecodeGenerator.addMethod')
+f(52,1609,1,1,'java/lang/invoke/InvokerBytecodeGenerator.methodPrologue')
+f(53,1609,1,1,'jdk/internal/org/objectweb/asm/ClassWriter.visitMethod')
+f(54,1609,1,1,'jdk/internal/org/objectweb/asm/MethodWriter.<init>')
+f(55,1609,1,1,'jdk/internal/org/objectweb/asm/SymbolTable.addConstantUtf8')
+f(56,1609,1,1,'jdk/internal/org/objectweb/asm/ByteVector.putUTF8')
+f(1,1610,10426,1,'java/util/concurrent/ForkJoinWorkerThread.run')
+f(2,1610,10426,1,'java/util/concurrent/ForkJoinPool.runWorker')
+f(3,1610,10426,1,'java/util/concurrent/ForkJoinPool.scan')
+f(4,1610,10426,1,'java/util/concurrent/ForkJoinPool$WorkQueue.topLevelExec')
+f(5,1610,10426,1,'java/util/concurrent/ForkJoinTask.doExec')
+f(6,1610,10426,1,'java/util/concurrent/CountedCompleter.exec')
+f(7,1610,10426,1,'java/util/stream/AbstractTask.compute')
+f(8,1610,1,1,'java/util/concurrent/CountedCompleter.tryComplete')
+f(9,1610,1,1,'java/util/stream/ReduceOps$ReduceTask.onCompletion')
+f(10,1610,1,1,'java/util/stream/ReduceOps$2ReducingSink.combine')
+f(11,1610,1,1,'java/util/stream/ReduceOps$2ReducingSink.combine')
+f(12,1610,1,1,'java/util/stream/ReduceOps$2ReducingSink.accept')
+f(13,1610,1,1,'dev/morling/onebrc/CalculateAverage_Run6$$Lambda.0x00007f2b93000c20.apply')
+f(14,1610,1,1,'dev/morling/onebrc/CalculateAverage_Run6.lambda$main$1')
+f(15,1610,1,1,'dev/morling/onebrc/CalculateAverage_Run6.mergeMeasurementMaps')
+f(16,1610,1,1,'java/lang/invoke/MethodHandleNatives.linkCallSite')
+f(17,1610,1,1,'java/lang/invoke/MethodHandleNatives.linkCallSiteImpl')
+f(18,1610,1,1,'java/lang/invoke/CallSite.makeSite')
+f(19,1610,1,1,'java/lang/invoke/BootstrapMethodInvoker.invoke')
+f(20,1610,1,1,'java/lang/invoke/Invokers$Holder.invokeExact_MT')
+f(21,1610,1,1,'java/lang/invoke/DirectMethodHandle$Holder.invokeStatic')
+f(22,1610,1,1,'java/lang/invoke/LambdaMetafactory.metafactory')
+f(23,1610,1,1,'java/lang/invoke/InnerClassLambdaMetafactory.buildCallSite')
+f(24,1610,1,1,'java/lang/invoke/MethodHandles$Lookup.findConstructor')
+f(25,1610,1,1,'java/lang/invoke/MethodHandles$Lookup.resolveOrFail')
+f(26,1610,1,1,'java/lang/invoke/MemberName.<init>')
+f(27,1610,1,0,'java/lang/invoke/MemberName.initResolved',0,0,1)
+f(8,1611,10425,1,'java/util/stream/ReduceOps$ReduceTask.doLeaf')
+f(9,1611,10425,1,'java/util/stream/ReduceOps$ReduceTask.doLeaf')
+f(10,1611,10425,1,'java/util/stream/AbstractPipeline.wrapAndCopyInto')
+f(11,1611,10425,1,'java/util/stream/AbstractPipeline.copyInto')
+f(12,1611,10425,1,'java/util/Spliterator$OfLong.forEachRemaining')
+f(13,1611,10425,1,'java/util/stream/Streams$RangeLongSpliterator.forEachRemaining')
+f(14,1611,10425,1,'java/util/stream/LongPipeline$1$1.accept')
+f(15,1611,10425,1,'dev/morling/onebrc/CalculateAverage_Run6$$Lambda.0x00007f2b93000a00.apply')
+f(16,1611,10425,1,'dev/morling/onebrc/CalculateAverage_Run6.lambda$main$0')
+f(17,1611,10420,1,'dev/morling/onebrc/CalculateAverage_Run6.extractMeasurementsFromChunk',0,0,7)
+f(18,1921,13,2,'dev/morling/onebrc/CalculateAverage_Run6$Key.clear',12,0,0)
+f(18,1934,697,2,'dev/morling/onebrc/CalculateAverage_Run6$Measurement.sample',636,0,0)
+f(19,2629,1,5,'asm_sysvec_apic_timer_interrupt')
+f(20,2629,1,5,'sysvec_apic_timer_interrupt')
+f(21,2629,1,5,'irq_exit_rcu')
+f(22,2629,1,5,'do_softirq_own_stack')
+f(23,2629,1,5,'asm_call_sysvec_on_stack')
+f(24,2629,1,5,'__softirqentry_text_start')
+f(19,2630,1,1,'java/lang/Math.min')
+f(18,2631,3561,2,'dev/morling/onebrc/CalculateAverage_Run6.readKey',3302,0,1)
+f(19,4049,752,2,'dev/morling/onebrc/CalculateAverage_Run6$Key.append',696,0,0)
+f(19,4801,544,2,'java/nio/Buffer.remaining',511,0,0)
+f(19,5345,847,2,'java/nio/DirectByteBuffer.get',796,0,0)
+f(20,5345,357,2,'java/nio/Buffer.nextGetIndex',339,0,1)
+f(21,5701,1,4,'InterpreterRuntime::frequency_counter_overflow(JavaThread*, unsigned char*)')
+f(22,5701,1,4,'InterpreterRuntime::frequency_counter_overflow_inner(JavaThread*, unsigned char*)')
+f(23,5701,1,4,'CompilationPolicy::event(methodHandle const&, methodHandle const&, int, int, CompLevel, CompiledMethod*, JavaThread*)')
+f(24,5701,1,4,'CompilationPolicy::method_invocation_event(methodHandle const&, methodHandle const&, CompLevel, CompiledMethod*, JavaThread*)')
+f(25,5701,1,4,'CompilationPolicy::create_mdo(methodHandle const&, JavaThread*)')
+f(20,5702,1,0,'java/nio/DirectByteBuffer.ix',0,0,1)
+f(20,5703,489,2,'jdk/internal/misc/ScopedMemoryAccess.getByte',457,0,0)
+f(21,5703,489,2,'jdk/internal/misc/ScopedMemoryAccess.getByteInternal',457,0,0)
+f(22,6163,29,5,'asm_exc_page_fault')
+f(23,6163,29,5,'exc_page_fault')
+f(24,6163,29,5,'do_user_addr_fault')
+f(25,6171,21,5,'handle_mm_fault')
+f(26,6171,20,5,'__handle_mm_fault')
+f(27,6173,18,5,'do_fault')
+f(28,6173,18,5,'do_fault_around')
+f(29,6173,18,5,'filemap_map_pages')
+f(30,6175,15,5,'alloc_set_pte')
+f(31,6178,10,5,'page_add_file_rmap')
+f(32,6180,5,5,'__mod_lruvec_state')
+f(33,6181,4,5,'__mod_node_page_state')
+f(32,6185,3,5,'lock_page_memcg')
+f(31,6188,2,5,'unlock_page_memcg')
+f(30,6190,1,5,'xas_find')
+f(26,6191,1,5,'mem_cgroup_from_task')
+f(18,6192,2384,2,'dev/morling/onebrc/CalculateAverage_Run6.readTemperatureFromBuffer',2127,0,0)
+f(19,6863,2,5,'asm_sysvec_apic_timer_interrupt')
+f(20,6863,2,5,'sysvec_apic_timer_interrupt')
+f(21,6863,2,5,'irq_exit_rcu')
+f(22,6863,2,5,'do_softirq_own_stack')
+f(23,6863,2,5,'asm_call_sysvec_on_stack')
+f(24,6863,2,5,'__softirqentry_text_start')
+f(25,6864,1,5,'rcu_core')
+f(26,6864,1,5,'rcu_do_batch')
+f(27,6864,1,5,'file_free_rcu')
+f(19,6865,850,2,'java/nio/Buffer.remaining',761,0,0)
+f(19,7715,861,2,'java/nio/DirectByteBuffer.get',759,0,0)
+f(20,7715,10,2,'java/nio/Buffer.checkIndex',10,0,0)
+f(20,7725,521,2,'java/nio/Buffer.nextGetIndex',462,0,0)
+f(20,8246,330,2,'jdk/internal/misc/ScopedMemoryAccess.getByte',287,0,0)
+f(21,8246,330,2,'jdk/internal/misc/ScopedMemoryAccess.getByteInternal',287,0,0)
+f(22,8560,15,5,'asm_exc_page_fault')
+f(23,8560,15,5,'exc_page_fault')
+f(24,8560,15,5,'do_user_addr_fault')
+f(25,8566,9,5,'handle_mm_fault')
+f(26,8566,9,5,'__handle_mm_fault')
+f(27,8566,9,5,'do_fault')
+f(28,8566,9,5,'do_fault_around')
+f(29,8567,8,5,'filemap_map_pages')
+f(30,8569,5,5,'alloc_set_pte')
+f(31,8570,3,5,'page_add_file_rmap')
+f(32,8571,2,5,'__mod_memcg_lruvec_state')
+f(33,8571,2,5,'__mod_memcg_state.part.0')
+f(31,8573,1,5,'pte_alloc_one_map')
+f(30,8574,1,5,'unlock_page')
+f(22,8575,1,0,'java/lang/ref/Reference.reachabilityFence',0,0,1)
+f(18,8576,453,2,'dev/morling/onebrc/CalculateAverage_Run6.skipToFirstLine',368,0,0)
+f(18,9029,1,1,'java/lang/invoke/Invokers$Holder.linkToTargetMethod')
+f(19,9029,1,1,'java/lang/invoke/LambdaForm$MH.0x00007f2b93002000.invoke')
+f(18,9030,1,1,'java/lang/invoke/MethodHandleNatives.linkCallSite')
+f(19,9030,1,1,'java/lang/invoke/MethodHandleNatives.linkCallSiteImpl')
+f(20,9030,1,1,'java/lang/invoke/CallSite.makeSite')
+f(21,9030,1,1,'java/lang/invoke/BootstrapMethodInvoker.invoke')
+f(22,9030,1,1,'java/lang/invoke/Invokers$Holder.invokeExact_MT')
+f(23,9030,1,1,'java/lang/invoke/DirectMethodHandle$Holder.invokeStatic')
+f(24,9030,1,1,'java/lang/invoke/LambdaMetafactory.metafactory')
+f(25,9030,1,1,'java/lang/invoke/InnerClassLambdaMetafactory.buildCallSite')
+f(26,9030,1,1,'java/lang/invoke/InnerClassLambdaMetafactory.spinInnerClass')
+f(27,9030,1,1,'java/lang/invoke/InnerClassLambdaMetafactory.generateInnerClass')
+f(28,9030,1,1,'java/lang/invoke/MethodHandles$Lookup$ClassDefiner.defineClass')
+f(29,9030,1,1,'java/lang/System$2.defineClass')
+f(30,9030,1,0,'java/lang/ClassLoader.defineClass0',0,0,1)
+f(31,9030,1,3,'Java_java_lang_ClassLoader_defineClass0')
+f(32,9030,1,3,'JVM_LookupDefineClass')
+f(33,9030,1,3,'jvm_lookup_define_class(_jclass*, char const*, signed char const*, int, _jobject*, unsigned char, int, _jobject*, JavaThread*)')
+f(34,9030,1,4,'SystemDictionary::resolve_from_stream(ClassFileStream*, Symbol*, Handle, ClassLoadInfo const&, JavaThread*)')
+f(35,9030,1,4,'KlassFactory::create_from_stream(ClassFileStream*, Symbol*, ClassLoaderData*, ClassLoadInfo const&, JavaThread*)')
+f(36,9030,1,4,'ClassFileParser::create_instance_klass(bool, ClassInstanceInfo const&, JavaThread*)')
+f(37,9030,1,4,'ClassFileParser::fill_instance_klass(InstanceKlass*, bool, ClassInstanceInfo const&, JavaThread*)')
+f(38,9030,1,4,'DefaultMethods::generate_default_methods(InstanceKlass*, GrowableArray<Method*> const*, JavaThread*)')
+f(39,9030,1,4,'HierarchyVisitor<FindMethodsByErasedSig>::run(InstanceKlass*)')
+f(40,9030,1,4,'StatefulMethodFamily::record_method_and_dq_further(StateRestorerScope*, Method*)')
+f(18,9031,11,2,'java/nio/Buffer.position',10,0,0)
+f(18,9042,76,2,'java/nio/Buffer.remaining',70,0,0)
+f(18,9118,2907,1,'java/util/HashMap.computeIfAbsent')
+f(19,10676,1296,2,'dev/morling/onebrc/CalculateAverage_Run6$Key.equals',1293,0,0)
+f(20,11119,853,2,'java/util/Arrays.equals',851,0,0)
+f(21,11127,135,2,'java/util/Arrays.rangeCheck',135,0,0)
+f(21,11262,710,2,'jdk/internal/util/ArraysSupport.mismatch',710,0,0)
+f(22,11789,1,5,'asm_sysvec_apic_timer_interrupt')
+f(23,11789,1,5,'sysvec_apic_timer_interrupt')
+f(24,11789,1,5,'irq_exit_rcu')
+f(25,11789,1,5,'do_softirq_own_stack')
+f(26,11789,1,5,'asm_call_sysvec_on_stack')
+f(27,11789,1,5,'__softirqentry_text_start')
+f(22,11790,182,3,'vectorizedMismatch')
+f(19,11972,53,2,'java/util/HashMap.hash',53,0,0)
+f(20,12018,7,2,'dev/morling/onebrc/CalculateAverage_Run6$Key.hashCode',7,0,0)
+f(18,12025,6,1,'sun/nio/ch/FileChannelImpl.map')
+f(19,12025,6,1,'sun/nio/ch/Util.newMappedByteBufferR')
+f(20,12025,6,1,'java/lang/reflect/Constructor.newInstance')
+f(21,12025,6,1,'java/lang/reflect/Constructor.newInstanceWithCaller')
+f(22,12025,6,1,'java/lang/reflect/Constructor.acquireConstructorAccessor')
+f(23,12025,6,1,'jdk/internal/reflect/ReflectionFactory.newConstructorAccessor')
+f(24,12025,6,1,'jdk/internal/reflect/MethodHandleAccessorFactory.newConstructorAccessor')
+f(25,12025,6,1,'java/lang/invoke/MethodHandle.asSpreader')
+f(26,12025,6,1,'java/lang/invoke/MethodHandle.asSpreader')
+f(27,12025,1,1,'java/lang/invoke/LambdaFormEditor.spreadArgumentsForm')
+f(28,12025,1,1,'java/lang/invoke/LambdaFormBuffer.endEdit')
+f(29,12025,1,0,'java/lang/invoke/LambdaForm$Name.replaceNames',0,0,1)
+f(27,12026,5,1,'java/lang/invoke/MethodHandle.asType')
+f(28,12026,5,1,'java/lang/invoke/MethodHandle.asTypeUncached')
+f(29,12026,5,1,'java/lang/invoke/MethodHandleImpl.makePairwiseConvert')
+f(30,12026,5,1,'java/lang/invoke/MethodHandleImpl.makePairwiseConvert')
+f(31,12026,5,1,'java/lang/invoke/MethodHandleImpl.makePairwiseConvertByEditor')
+f(32,12026,1,1,'java/lang/invoke/BoundMethodHandle$Species_L.copyWithExtendL')
+f(33,12026,1,1,'java/lang/invoke/DirectMethodHandle$Holder.invokeStatic')
+f(34,12026,1,1,'java/lang/invoke/BoundMethodHandle$Species_LL.make')
+f(35,12026,1,1,'java/lang/invoke/BoundMethodHandle$Species_LL.<init>')
+f(36,12026,1,1,'java/lang/invoke/BoundMethodHandle.<init>')
+f(37,12026,1,1,'java/lang/invoke/MethodHandle.<init>')
+f(38,12026,1,1,'java/lang/invoke/LambdaForm.prepare')
+f(39,12026,1,1,'java/lang/invoke/LambdaForm.compileToBytecode')
+f(40,12026,1,1,'java/lang/invoke/InvokerBytecodeGenerator.generateCustomizedCode')
+f(41,12026,1,1,'java/lang/invoke/InvokerBytecodeGenerator.generateCustomizedCodeBytes')
+f(42,12026,1,1,'java/lang/invoke/InvokerBytecodeGenerator.addMethod')
+f(43,12026,1,1,'jdk/internal/org/objectweb/asm/MethodWriter.visitAnnotation')
+f(44,12026,1,1,'jdk/internal/org/objectweb/asm/AnnotationWriter.create')
+f(45,12026,1,1,'jdk/internal/org/objectweb/asm/SymbolTable.addConstantUtf8')
+f(46,12026,1,1,'jdk/internal/org/objectweb/asm/ByteVector.putUTF8')
+f(47,12026,1,2,'java/lang/String.charAt',1,0,0)
+f(48,12026,1,2,'java/lang/String.isLatin1',1,0,0)
+f(32,12027,2,1,'java/lang/invoke/BoundMethodHandle$Species_LL.copyWithExtendL')
+f(33,12027,2,1,'java/lang/invoke/DirectMethodHandle$Holder.invokeStatic')
+f(34,12027,2,1,'java/lang/invoke/BoundMethodHandle$Species_LLL.make')
+f(35,12027,2,1,'java/lang/invoke/BoundMethodHandle$Species_LLL.<init>')
+f(36,12027,2,1,'java/lang/invoke/BoundMethodHandle.<init>')
+f(37,12027,2,1,'java/lang/invoke/MethodHandle.<init>')
+f(38,12027,2,1,'java/lang/invoke/LambdaForm.prepare')
+f(39,12027,2,1,'java/lang/invoke/LambdaForm.compileToBytecode')
+f(40,12027,2,1,'java/lang/invoke/InvokerBytecodeGenerator.generateCustomizedCode')
+f(41,12027,1,1,'java/lang/invoke/InvokerBytecodeGenerator.generateCustomizedCodeBytes')
+f(42,12027,1,1,'java/lang/invoke/InvokerBytecodeGenerator.addMethod')
+f(43,12027,1,1,'java/lang/invoke/InvokerBytecodeGenerator.emitStaticInvoke')
+f(44,12027,1,1,'java/lang/invoke/InvokerBytecodeGenerator.emitPushArguments')
+f(45,12027,1,1,'java/lang/invoke/InvokerBytecodeGenerator.emitPushArgument')
+f(46,12027,1,1,'java/lang/invoke/InvokerBytecodeGenerator.emitImplicitConversion')
+f(47,12027,1,1,'java/lang/invoke/InvokerBytecodeGenerator.emitReferenceCast')
+f(48,12027,1,1,'java/lang/invoke/LambdaForm.useCount')
+f(49,12027,1,1,'java/lang/Math.max')
+f(41,12028,1,1,'java/lang/invoke/InvokerBytecodeGenerator.loadMethod')
+f(42,12028,1,1,'java/lang/invoke/MethodHandles$Lookup$ClassDefiner.defineClass')
+f(43,12028,1,1,'java/lang/System$2.defineClass')
+f(44,12028,1,0,'java/lang/ClassLoader.defineClass0',0,0,1)
+f(45,12028,1,3,'Java_java_lang_ClassLoader_defineClass0')
+f(46,12028,1,3,'JVM_LookupDefineClass')
+f(47,12028,1,3,'jvm_lookup_define_class(_jclass*, char const*, signed char const*, int, _jobject*, unsigned char, int, _jobject*, JavaThread*)')
+f(48,12028,1,4,'SystemDictionary::resolve_from_stream(ClassFileStream*, Symbol*, Handle, ClassLoadInfo const&, JavaThread*)')
+f(49,12028,1,4,'KlassFactory::create_from_stream(ClassFileStream*, Symbol*, ClassLoaderData*, ClassLoadInfo const&, JavaThread*)')
+f(50,12028,1,4,'ClassFileParser::post_process_parsed_stream(ClassFileStream const*, ConstantPool*, JavaThread*)')
+f(51,12028,1,4,'FieldLayoutBuilder::compute_regular_layout()')
+f(52,12028,1,4,'FieldLayoutBuilder::prologue()')
+f(53,12028,1,4,'FieldLayout::initialize_instance_layout(InstanceKlass const*)')
+f(54,12028,1,4,'FieldLayout::reconstruct_layout(InstanceKlass const*)')
+f(55,12028,1,3,'free')
+f(32,12029,1,1,'java/lang/invoke/LambdaFormEditor.filterArgumentForm')
+f(33,12029,1,1,'java/lang/invoke/LambdaFormEditor.makeArgumentCombinationForm')
+f(34,12029,1,1,'java/lang/invoke/LambdaFormEditor.newSpeciesData')
+f(35,12029,1,1,'java/lang/invoke/BoundMethodHandle$SpeciesData.extendWith')
+f(36,12029,1,1,'java/lang/invoke/ClassSpecializer.findSpecies')
+f(37,12029,1,1,'java/lang/invoke/ClassSpecializer$Factory.loadSpecies')
+f(38,12029,1,1,'java/lang/invoke/ClassSpecializer$Factory.linkSpeciesDataToCode')
+f(39,12029,1,1,'java/lang/invoke/ClassSpecializer$Factory.findGetters')
+f(40,12029,1,1,'java/lang/invoke/ClassSpecializer$Factory.findGetter')
+f(41,12029,1,1,'java/lang/invoke/MethodHandles$Lookup.findGetter')
+f(42,12029,1,1,'java/lang/invoke/MethodHandles$Lookup.resolveOrFail')
+f(43,12029,1,1,'java/lang/invoke/MemberName.<init>')
+f(44,12029,1,0,'java/lang/invoke/MemberName.initResolved',0,0,1)
+f(32,12030,1,1,'java/lang/invoke/MethodHandle.bindTo')
+f(33,12030,1,1,'java/lang/invoke/MethodHandle.bindArgumentL')
+f(34,12030,1,1,'java/lang/invoke/BoundMethodHandle.bindArgumentL')
+f(35,12030,1,1,'java/lang/invoke/LambdaFormEditor.bindArgumentL')
+f(36,12030,1,1,'java/lang/invoke/BoundMethodHandle$Species_L.copyWithExtendL')
+f(37,12030,1,1,'java/lang/invoke/DirectMethodHandle$Holder.invokeStatic')
+f(38,12030,1,1,'java/lang/invoke/BoundMethodHandle$Species_LL.make')
+f(39,12030,1,1,'java/lang/invoke/BoundMethodHandle$Species_LL.<init>')
+f(40,12030,1,1,'java/lang/invoke/BoundMethodHandle.<init>')
+f(41,12030,1,1,'java/lang/invoke/MethodHandle.<init>')
+f(42,12030,1,1,'java/lang/invoke/LambdaForm.prepare')
+f(43,12030,1,1,'java/lang/invoke/LambdaForm.compileToBytecode')
+f(44,12030,1,1,'java/lang/invoke/InvokerBytecodeGenerator.generateCustomizedCode')
+f(45,12030,1,1,'java/lang/invoke/InvokerBytecodeGenerator.generateCustomizedCodeBytes')
+f(46,12030,1,1,'java/lang/invoke/InvokerBytecodeGenerator.clinit')
+f(47,12030,1,1,'jdk/internal/org/objectweb/asm/ClassWriter.visitField')
+f(48,12030,1,1,'jdk/internal/org/objectweb/asm/FieldWriter.<init>')
+f(49,12030,1,1,'jdk/internal/org/objectweb/asm/SymbolTable.addConstantUtf8')
+f(17,12031,5,1,'java/util/HashMap.computeIfAbsent')
+f(18,12031,5,2,'dev/morling/onebrc/CalculateAverage_Run6$Key.equals',5,0,0)
+f(19,12031,5,2,'java/util/Arrays.equals',5,0,0)
+f(20,12031,5,2,'jdk/internal/util/ArraysSupport.mismatch',5,0,0)
+f(1,12036,32,3,'start_thread')
+f(2,12036,32,3,'thread_native_entry(Thread*)')
+f(3,12036,32,4,'Thread::call_run()')
+f(4,12036,32,4,'JavaThread::thread_main_inner()')
+f(5,12036,32,4,'CompileBroker::compiler_thread_loop()')
+f(6,12036,32,4,'CompileBroker::invoke_compiler_on_method(CompileTask*)')
+f(7,12036,24,4,'C2Compiler::compile_method(ciEnv*, ciMethod*, int, bool, DirectiveSet*)')
+f(8,12036,24,4,'Compile::Compile(ciEnv*, ciMethod*, int, Options, DirectiveSet*)')
+f(9,12036,10,4,'Compile::Code_Gen()')
+f(10,12036,1,4,'Matcher::match()')
+f(11,12036,1,4,'Matcher::xform(Node*, int)')
+f(12,12036,1,4,'Node::clone() const')
+f(10,12037,2,4,'PhaseCFG::do_global_code_motion()')
+f(11,12037,2,4,'PhaseCFG::global_code_motion()')
+f(12,12037,1,4,'PhaseCFG::schedule_local(Block*, GrowableArray<int>&, VectorSet&, long*)')
+f(13,12037,1,4,'PhaseCFG::select(Block*, Node_List&, GrowableArray<int>&, VectorSet&, unsigned int, long*)')
+f(12,12038,1,4,'compU_rRegNode::ideal_Opcode() const')
+f(10,12039,5,4,'PhaseChaitin::Register_Allocate()')
+f(11,12039,1,4,'PhaseChaitin::build_ifg_physical(ResourceArea*)')
+f(12,12039,1,4,'PhaseChaitin::add_input_to_liveout(Block*, Node*, IndexSet*, double, PhaseChaitin::Pressure&, PhaseChaitin::Pressure&)')
+f(13,12039,1,4,'PhaseChaitin::raise_pressure(Block*, LRG&, PhaseChaitin::Pressure&, PhaseChaitin::Pressure&) [clone .part.0]')
+f(11,12040,1,4,'PhaseChaitin::gather_lrg_masks(bool) [clone .constprop.0]')
+f(12,12040,1,4,'MachSpillCopyNode::ideal_reg() const')
+f(11,12041,1,4,'PhaseCoalesce::coalesce_driver()')
+f(12,12041,1,4,'PhaseConservativeCoalesce::coalesce(Block*)')
+f(13,12041,1,4,'PhaseConservativeCoalesce::copy_copy(Node*, Node*, Block*, unsigned int) [clone .part.0]')
+f(14,12041,1,4,'IndexSet::lrg_union(unsigned int, unsigned int, unsigned int, PhaseIFG const*, RegMask const&)')
+f(11,12042,1,4,'PhaseIFG::SquareUp()')
+f(12,12042,1,4,'IndexSet::alloc_block_containing(unsigned int)')
+f(11,12043,1,4,'PhaseLive::compute(unsigned int)')
+f(10,12044,1,4,'PhaseOutput::Output()')
+f(11,12044,1,4,'PhaseOutput::BuildOopMaps()')
+f(10,12045,1,4,'PhaseOutput::fill_buffer(CodeBuffer*, unsigned int*)')
+f(11,12045,1,4,'MachSpillCopyNode::implementation(CodeBuffer*, PhaseRegAlloc*, bool, outputStream*) const')
+f(9,12046,11,4,'Compile::Optimize()')
+f(10,12046,1,4,'Compile::final_graph_reshaping()')
+f(11,12046,1,4,'IfNode::Opcode() const')
+f(10,12047,5,4,'PhaseIdealLoop::build_and_optimize()')
+f(11,12047,1,4,'PhaseIdealLoop::Dominators()')
+f(11,12048,2,4,'PhaseIdealLoop::build_loop_late(VectorSet&, Node_List&, Node_Stack&)')
+f(12,12049,1,4,'PhaseIdealLoop::build_loop_late_post_work(Node*, bool)')
+f(13,12049,1,4,'PhaseIdealLoop::compute_lca_of_uses(Node*, Node*, bool)')
+f(14,12049,1,4,'PhaseIdealLoop::dom_lca_for_get_late_ctrl_internal(Node*, Node*, Node*)')
+f(11,12050,1,4,'PhaseIdealLoop::build_loop_tree()')
+f(11,12051,1,4,'PhaseIdealLoop::split_if_with_blocks(VectorSet&, Node_Stack&)')
+f(12,12051,1,4,'IfTrueNode::Opcode() const')
+f(10,12052,2,4,'PhaseIdealLoop::optimize(PhaseIterGVN&, LoopOptsMode)')
+f(11,12052,2,4,'PhaseIterGVN::optimize()')
+f(12,12052,2,4,'PhaseIterGVN::transform_old(Node*)')
+f(13,12052,1,4,'BoolNode::Ideal(PhaseGVN*, bool)')
+f(13,12053,1,4,'ConvL2INode::Value(PhaseGVN*) const')
+f(14,12053,1,4,'Type::hashcons()')
+f(15,12053,1,4,'Dict::Insert(void*, void*, bool)')
+f(16,12053,1,4,'Dict::doubhash()')
+f(10,12054,2,4,'PhaseIterGVN::optimize()')
+f(11,12054,2,4,'PhaseIterGVN::transform_old(Node*)')
+f(12,12055,1,4,'IfNode::Ideal(PhaseGVN*, bool)')
+f(13,12055,1,4,'IfNode::Ideal_common(PhaseGVN*, bool)')
+f(14,12055,1,4,'PhaseIterGVN::add_users_to_worklist0(Node*)')
+f(10,12056,1,4,'PhaseMacroExpand::expand_macro_nodes()')
+f(11,12056,1,4,'PhaseIterGVN::optimize()')
+f(12,12056,1,4,'PhaseIterGVN::transform_old(Node*)')
+f(13,12056,1,4,'SafePointNode::Ideal(PhaseGVN*, bool)')
+f(14,12056,1,4,'Node::remove_dead_region(PhaseGVN*, bool)')
+f(15,12056,1,4,'MergeMemNode::hash() const')
+f(9,12057,3,4,'ParseGenerator::generate(JVMState*)')
+f(10,12057,3,4,'Parse::Parse(JVMState*, ciMethod*, float)')
+f(11,12057,3,4,'Parse::do_all_blocks()')
+f(12,12057,2,4,'Parse::do_one_block()')
+f(13,12057,2,4,'Parse::do_call()')
+f(14,12057,1,4,'Compile::call_generator(ciMethod*, int, bool, JVMState*, bool, float, ciKlass*, bool)')
+f(15,12057,1,4,'InlineTree::ok_to_inline(ciMethod*, JVMState*, ciCallProfile&, bool&)')
+f(16,12057,1,4,'ciMethod::get_flow_analysis()')
+f(17,12057,1,4,'ciTypeFlow::ciTypeFlow(ciEnv*, ciMethod*, int)')
+f(18,12057,1,4,'ciMethod::get_method_blocks()')
+f(19,12057,1,4,'ciMethodBlocks::ciMethodBlocks(Arena*, ciMethod*)')
+f(20,12057,1,4,'ciMethodBlocks::do_analysis()')
+f(14,12058,1,4,'ParseGenerator::generate(JVMState*)')
+f(15,12058,1,4,'Parse::Parse(JVMState*, ciMethod*, float)')
+f(16,12058,1,4,'Parse::do_all_blocks()')
+f(17,12058,1,4,'Parse::do_one_block()')
+f(18,12058,1,4,'Parse::do_call()')
+f(19,12058,1,4,'PredictedCallGenerator::generate(JVMState*)')
+f(20,12058,1,4,'PredictedCallGenerator::generate(JVMState*)')
+f(21,12058,1,4,'GraphKit::type_check_receiver(Node*, ciKlass*, float, Node**)')
+f(22,12058,1,4,'GraphKit::load_object_klass(Node*)')
+f(23,12058,1,4,'LoadKlassNode::make(PhaseGVN&, Node*, Node*, Node*, TypePtr const*, TypeKlassPtr const*)')
+f(24,12058,1,3,'__memset_avx2_unaligned_erms')
+f(12,12059,1,4,'Parse::merge_common(Parse::Block*, int)')
+f(13,12059,1,4,'Parse::merge_memory_edges(MergeMemNode*, int, bool)')
+f(14,12059,1,4,'MergeMemNode::iteration_setup(MergeMemNode const*)')
+f(15,12059,1,4,'Node::add_req(Node*)')
+f(7,12060,8,4,'Compiler::compile_method(ciEnv*, ciMethod*, int, bool, DirectiveSet*)')
+f(8,12060,8,4,'Compilation::Compilation(AbstractCompiler*, ciEnv*, ciMethod*, int, BufferBlob*, bool, DirectiveSet*)')
+f(9,12060,8,4,'Compilation::compile_method()')
+f(10,12060,7,4,'Compilation::compile_java_method()')
+f(11,12060,4,4,'Compilation::build_hir() [clone .part.0]')
+f(12,12060,4,4,'IR::IR(Compilation*, ciMethod*, int)')
+f(13,12060,4,4,'IRScope::IRScope(Compilation*, IRScope*, int, ciMethod*, int, bool)')
+f(14,12060,4,4,'GraphBuilder::GraphBuilder(Compilation*, IRScope*)')
+f(15,12060,4,4,'GraphBuilder::iterate_all_blocks(bool)')
+f(16,12060,4,4,'GraphBuilder::iterate_bytecodes_for_block(int)')
+f(17,12060,3,4,'GraphBuilder::invoke(Bytecodes::Code)')
+f(18,12060,3,4,'GraphBuilder::try_inline(ciMethod*, bool, bool, Bytecodes::Code, Instruction*)')
+f(19,12060,3,4,'GraphBuilder::try_inline_full(ciMethod*, bool, bool, Bytecodes::Code, Instruction*)')
+f(20,12060,1,4,'GraphBuilder::iterate_all_blocks(bool)')
+f(21,12060,1,4,'GraphBuilder::iterate_bytecodes_for_block(int)')
+f(22,12060,1,4,'GraphBuilder::invoke(Bytecodes::Code)')
+f(23,12060,1,4,'GraphBuilder::try_inline(ciMethod*, bool, bool, Bytecodes::Code, Instruction*)')
+f(24,12060,1,4,'GraphBuilder::try_inline_full(ciMethod*, bool, bool, Bytecodes::Code, Instruction*)')
+f(25,12060,1,4,'GraphBuilder::iterate_all_blocks(bool)')
+f(26,12060,1,4,'GraphBuilder::iterate_bytecodes_for_block(int)')
+f(27,12060,1,4,'GraphBuilder::invoke(Bytecodes::Code)')
+f(28,12060,1,4,'ciBytecodeStream::get_declared_method_holder()')
+f(29,12060,1,4,'ciEnv::get_klass_by_index_impl(constantPoolHandle const&, int, bool&, ciInstanceKlass*)')
+f(30,12060,1,4,'ConstantPool::klass_at_if_loaded(constantPoolHandle const&, int)')
+f(31,12060,1,4,'LinkResolver::check_klass_accessibility(Klass*, Klass*, JavaThread*)')
+f(32,12060,1,4,'Klass::is_subclass_of(Klass const*) const')
+f(20,12061,1,4,'GraphBuilder::push_scope(ciMethod*, BlockBegin*)')
+f(21,12061,1,4,'ValueStack::ValueStack(ValueStack*, ValueStack::Kind, int)')
+f(20,12062,1,4,'ciMethod::method_data()')
+f(17,12063,1,3,'__tls_get_addr')
+f(11,12064,3,4,'Compilation::emit_lir()')
+f(12,12064,3,4,'LinearScan::do_linear_scan()')
+f(13,12064,1,4,'LinearScan::allocate_registers()')
+f(14,12064,1,4,'LinearScanWalker::activate_current()')
+f(15,12064,1,4,'LinearScanWalker::alloc_free_reg(Interval*)')
+f(13,12065,1,4,'LinearScan::assign_reg_num(GrowableArray<LIR_Op*>*, IntervalWalker*)')
+f(14,12065,1,4,'LinearScan::compute_oop_map(IntervalWalker*, LIR_OpVisitState const&, LIR_Op*)')
+f(15,12065,1,4,'LinearScan::compute_oop_map(IntervalWalker*, LIR_Op*, CodeEmitInfo*, bool)')
+f(16,12065,1,4,'IntervalWalker::walk_to(int)')
+f(13,12066,1,4,'LinearScan::build_intervals()')
+f(10,12067,1,4,'Compilation::install_code(int)')
+f(11,12067,1,4,'ciEnv::register_method(ciMethod*, int, CodeOffsets*, int, CodeBuffer*, int, OopMapSet*, ExceptionHandlerTable*, ImplicitExceptionTable*, AbstractCompiler*, bool, bool, bool, int, RTMState)')
+f(12,12067,1,4,'nmethod::new_nmethod(methodHandle const&, int, int, CodeOffsets*, int, DebugInformationRecorder*, Dependencies*, CodeBuffer*, int, OopMapSet*, ExceptionHandlerTable*, ImplicitExceptionTable*, AbstractCompiler*, CompLevel, char*, int, JVMCINMethodData*)')
+f(13,12067,1,4,'nmethod::nmethod(Method*, CompilerType, int, int, int, CodeOffsets*, int, DebugInformationRecorder*, Dependencies*, CodeBuffer*, int, OopMapSet*, ExceptionHandlerTable*, ImplicitExceptionTable*, AbstractCompiler*, CompLevel, char*, int, JVMCINMethodData*)')
+f(14,12067,1,4,'CodeBuffer::copy_code_to(CodeBlob*)')
+f(15,12067,1,4,'CodeBuffer::relocate_code_to(CodeBuffer*) const')
+f(16,12067,1,4,'CallRelocation::fix_relocation_after_move(CodeBuffer const*, CodeBuffer*)')
+f(17,12067,1,4,'Relocation::pd_call_destination(unsigned char*)')
+
+search();
+</script></body></html>
